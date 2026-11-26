@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.store import store
+from app.services.round_ledger import round_ledger
 
 CST = timezone(timedelta(hours=8))
 
@@ -25,6 +26,10 @@ def _now_dt() -> datetime:
 
 class CrossModuleService:
     """跨模块数据流协调器：将9组领域Service串联为真实业务流程。"""
+
+    def __getattr__(self, name: str) -> Any:
+        # Flow 9 的轮次封口/恢复/回单导出规则集中在 round_ledger。
+        return getattr(round_ledger, name)
 
     # ========================
     # Flow 1: device_registry + protocol_cfg → 设备注册与协议适配

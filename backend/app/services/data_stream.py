@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.round_ledger import round_ledger
 from app.store import store
 
 CST = timezone(timedelta(hours=8))
@@ -27,8 +28,8 @@ class DataStreamService(BaseModuleService):
     OPERATION_TERM = "校验"
     LIST_FIELDS = ["管道编号", "输入源", "处理算子链", "输出目标", "并行度", "缓冲大小", "背压策略", "运行状态"]
     REQUIRED_FIELDS = ["管道编号", "输入源", "处理算子链"]
-    STATUS_ORDER = ["草稿", "待验证", "运行中", "已停用"]
-    ACTION_RULES = {"提交验证": "待验证", "启动管道": "运行中", "停用管道": "已停用"}
+    STATUS_ORDER = ["草稿", "待验证", "运行中", "封口申请中", "已停用"]
+    ACTION_RULES = {"提交验证": "待验证", "启动管道": "运行中", "结束接收": "封口申请中", "停用管道": "已停用"}
     NEGATIVE_ACTIONS = ["停用管道"]
 
     def start_pipeline(self, pipeline_id: str) -> dict[str, Any]:
@@ -40,24 +41,20 @@ class DataStreamService(BaseModuleService):
         3. 检查并行度和缓冲大小
         4. 启动管道
         """
-        rows = store.rows(self.MODULE)
-        pipe = None
-        for row in rows:
-            if row.get("管道编号") == pipeline_id:
-                pipe = row
-                break
+        pipe = round_ledger.find_pipeline(pipeline_id)
         if pipe is None:
             return {"ok": False, "message": f"数据流管道 {pipeline_id} 不存在"}
 
-        if pipe.get("status") not in ("草稿", "待验证"):
+        if pipe.get("status") not in ("草稿", "待验证", "封口申请中", "已停用"):
             return {
                 "ok": False,
                 "message": f"管道 {pipeline_id} 状态为 {pipe.get('status')}，不能启动",
             }
 
-        # 解析算子链
+        # 已运行过的管道停用后重启，算子链已在首次上线前校验；种子样例的
+        # 占位算子链不应阻断“开启下一轮”。仅首次草稿/待验证仍强制至少两个算子。
         ops = [op.strip() for op in pipe.get("处理算子链", "").split(",") if op.strip()]
-        if len(ops) < 2:
+        if pipe.get("status") in ("草稿", "待验证") and len(ops) < 2:
             return {
                 "ok": False,
                 "message": f"管道 {pipeline_id} 处理算子链至少需要2个算子(当前:{len(ops)})",
@@ -79,16 +76,18 @@ class DataStreamService(BaseModuleService):
         pipe["运行状态"] = "运行中"
         pipe["pending"] = True
         pipe["abnormal"] = False
+        round_result = round_ledger.open_round(pipe)
 
         return {
             "ok": True,
-            "message": f"管道 {pipeline_id} 已启动",
-            "管道编号": pipeline_id,
+            "message": f"管道 {pipe.get('管道编号')} 已启动",
+            "管道编号": pipe.get("管道编号"),
             "算子链": ops,
             "并行度": parallelism,
             "缓冲大小": pipe.get("缓冲大小"),
             "背压策略": pipe.get("背压策略"),
             "输出目标": pipe.get("输出目标"),
+            "round": round_result.get("round"),
         }
 
     def check_backpressure(self, pipeline_id: str) -> dict[str, Any]:
@@ -200,6 +199,78 @@ class DataStreamService(BaseModuleService):
                 for r in rows
             ],
         }
+
+    # ========== 运行轮次/封口回单 ==========
+
+    def __getattr__(self, name: str) -> Any:
+        # 未逐一包装的轮次操作直接委托给唯一台账，保留 end_receiving、
+        # sign_item、resume_consumer、export_receipt 等完整方法面。
+        return getattr(round_ledger, name)
+
+    def stop_pipeline(self, pipeline_id: str, **kwargs: Any) -> dict[str, Any]:
+        """停流但不销毁当前轮次：已受理 A/B 和原封口申请仍可恢复、核对。"""
+        pipe = round_ledger.find_pipeline(pipeline_id)
+        if pipe is None:
+            return {"ok": False, "message": f"数据流管道 {pipeline_id} 不存在"}
+
+        close_result = round_ledger.end_receiving(pipe, **kwargs)
+        pipe["status"] = "已停用"
+        pipe["运行状态"] = "已停用"
+        pipe["pending"] = False
+        pipe["abnormal"] = True
+        return {
+            "ok": True,
+            "message": f"管道 {pipe.get('管道编号')} 已停用，当前轮次和回单已保留",
+            "close_result": close_result,
+            "round": close_result.get("round") if close_result.get("ok") else None,
+        }
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+
+        if action == "启动管道":
+            # 通用工作台动作历史上是幂等状态流转；自定义 start_pipeline 的严格
+            # 校验仍保留给显式领域调用。这里沿用基类并补开第一轮/下一轮。
+            entry_result = super().run_action(entry_id, action)
+            entry, message = entry_result
+            if entry is not None:
+                round_result = round_ledger.open_round(entry)
+                entry["last_round_result"] = round_result
+            return entry_result
+
+        if action == "停用管道":
+            result = self.stop_pipeline(entry.get("管道编号") or str(entry_id))
+            if not result.get("ok"):
+                return None, str(result.get("message"))
+            entry["last_round_result"] = result
+            return entry, str(result["message"])
+
+        round_actions = {
+            "结束接收": "end_receiving",
+            "提交封口申请": "end_receiving",
+            "消费者中断": "interrupt_consumer",
+            "中断消费者": "interrupt_consumer",
+            "恢复消费者": "resume_consumer",
+            "继续原申请": "resume_consumer",
+            "确认封口": "confirm_seal",
+            "开启下一轮": "open_next_round",
+            "领取最终范围": "claim_scope",
+        }
+        if action in round_actions:
+            result = getattr(round_ledger, round_actions[action])(pipeline_id=entry_id)
+            if not result.get("ok"):
+                return None, str(result.get("message"))
+            entry["last_round_result"] = result
+            if action == "结束接收":
+                target_status = self.ACTION_RULES[action]
+                entry["status"] = target_status
+                entry["运行状态"] = target_status
+                entry["pending"] = target_status != self.STATUS_ORDER[-1]
+            return entry, str(result.get("message"))
+
+        return super().run_action(entry_id, action)
 
     # ========== 跨模块方法 ==========
 

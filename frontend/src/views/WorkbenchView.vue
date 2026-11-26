@@ -15,6 +15,10 @@
       </div>
     </header>
 
+    <StreamRoundPanel v-if="meta.key === 'data_stream'" :pipelines="rows" />
+
+    <BatchReceiptPanel v-else-if="meta.key === 'batch_export'" />
+
     <div class="stat-row">
       <article v-for="item in stats" :key="item.label" class="stat-card">
         <span class="stat-label">{{ item.label }}</span>
@@ -94,7 +98,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import {
   createEntry,
@@ -104,6 +108,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import StreamRoundPanel from '@/components/StreamRoundPanel.vue'
+import BatchReceiptPanel from '@/components/BatchReceiptPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -171,6 +177,7 @@ async function runAction(action: string, row: EntryRow) {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
     await reload()
+    window.dispatchEvent(new CustomEvent('stream-workbench-action', { detail: { moduleKey: meta.key, action, rowId: row.id } }))
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
@@ -187,5 +194,17 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+function handleWorkbenchRefresh(event: Event) {
+  const detail = (event as CustomEvent).detail as { moduleKey?: string } | undefined
+  if (!detail?.moduleKey || detail.moduleKey === meta.key) void reload()
+}
+
+onMounted(() => {
+  void reload()
+  window.addEventListener('stream-workbench-action', handleWorkbenchRefresh)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('stream-workbench-action', handleWorkbenchRefresh)
+})
 </script>

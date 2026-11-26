@@ -1,9 +1,11 @@
 """跨模块数据流统一接口：暴露9组数据流的操作端点。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response
 
 from app.services.cross_module import cross_service
+from app.services.round_ledger import round_ledger
 
 router = APIRouter(prefix="/api/cross", tags=["跨模块数据流"])
 
@@ -174,6 +176,90 @@ def flow9_stream_export(
 def flow9_stream_export_matrix():
     """查询数据流管道与批量导出关联矩阵。"""
     return {"data": cross_service.query_stream_export_matrix()}
+
+
+async def _flow9_params(request: Request) -> dict:
+    params = dict(request.query_params)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        if isinstance(body, dict):
+            params.update(body)
+    return params
+
+
+@router.get("/flow9/rounds")
+async def flow9_rounds(pipeline_id: str | None = None):
+    return {"ok": True, "data": round_ledger.list_rounds(pipeline_id), "items": round_ledger.list_rounds(pipeline_id)}
+
+
+@router.post("/flow9/receive")
+async def flow9_receive(request: Request):
+    params = await _flow9_params(request)
+    target = params.pop("stream_id", None) or params.pop("pipeline_id", None) or params.pop("target", None)
+    return round_ledger.receive_records(target, **params)
+
+
+@router.post("/flow9/end-receiving")
+@router.post("/flow9/close-round")
+@router.post("/flow9/seal-application")
+async def flow9_end_receiving(request: Request):
+    params = await _flow9_params(request)
+    target = params.pop("stream_id", None) or params.pop("pipeline_id", None) or params.pop("target", None)
+    return round_ledger.end_receiving(target, **params)
+
+
+@router.post("/flow9/interrupt")
+async def flow9_interrupt(request: Request):
+    params = await _flow9_params(request)
+    return round_ledger.interrupt_consumer(params.pop("target", None), **params)
+
+
+@router.post("/flow9/resume")
+async def flow9_resume(request: Request):
+    params = await _flow9_params(request)
+    return round_ledger.resume_consumer(params.pop("target", None), **params)
+
+
+@router.post("/flow9/sign")
+async def flow9_sign(request: Request):
+    params = await _flow9_params(request)
+    return round_ledger.sign_item(params.pop("target", None), **params)
+
+
+@router.post("/flow9/seal")
+async def flow9_seal(request: Request):
+    params = await _flow9_params(request)
+    return round_ledger.confirm_seal(params.pop("target", None), **params)
+
+
+@router.post("/flow9/claim")
+async def flow9_claim(request: Request):
+    params = await _flow9_params(request)
+    return round_ledger.claim_scope(params.pop("target", None), **params)
+
+
+@router.get("/flow9/receipt")
+async def flow9_receipt(round_id: str | None = None, receipt_no: str | None = None, pipeline_id: str | None = None):
+    ref = round_id or receipt_no or pipeline_id
+    return round_ledger.get_receipt(ref)
+
+
+@router.api_route("/flow9/export-round", methods=["GET", "POST"])
+@router.post("/flow9/export")
+async def flow9_export_round(request: Request):
+    params = await _flow9_params(request)
+    ref = params.pop("round_id", None) or params.pop("receipt_no", None) or params.pop("target", None)
+    result = round_ledger.export_receipt(ref, **params)
+    if not result.get("ok") or params.get("json"):
+        return result
+    return Response(
+        content=result["csv"],
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{result["filename"]}"'},
+    )
 
 
 # ==================== 跨模块概览 ====================

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.round_ledger import round_ledger
 from app.store import store
 
 CST = timezone(timedelta(hours=8))
@@ -30,6 +31,14 @@ class BatchExportService(BaseModuleService):
     STATUS_ORDER = ["待执行", "导出中", "已完成", "已取消"]
     ACTION_RULES = {"发起导出": "导出中", "标记完成": "已完成", "取消导出": "已取消"}
     NEGATIVE_ACTIONS = []
+
+    def __getattr__(self, name: str) -> Any:
+        # 封口回单消费、旧轮结果领取/导出由轮次台账统一裁决。
+        return getattr(round_ledger, name)
+
+    def consume_round_receipt(self, round_ref: Any, **kwargs: Any) -> dict[str, Any]:
+        """批量导出消费一轮封口回单，并按封口确认范围创建交付任务。"""
+        return round_ledger.export_receipt(round_ref, **kwargs)
 
     def create_export(self, device_range: str, point_list: str,
                       format_type: str = "CSV",
